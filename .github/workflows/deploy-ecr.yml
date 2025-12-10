@@ -1,36 +1,82 @@
-# This is a basic workflow to help you get started with Actions
+name: CI/CD a AWS ECR y Elastic Beanstalk
 
-name: CI
-
-# Controls when the workflow will run
 on:
-  # Triggers the workflow on push or pull request events but only for the "main" branch
   push:
-    branches: [ "main" ]
-  pull_request:
-    branches: [ "main" ]
+    branches:
+      - main
 
-  # Allows you to run this workflow manually from the Actions tab
-  workflow_dispatch:
+# Define las variables de entorno
+env:
+  AWS_REGION: us-east-1                     # Tu región de AWS
+  ECR_REPOSITORY: palette-generator-repo    # Nombre del repo de ECR (Parte 1)
+  EB_APPLICATION_NAME: palette-generator-ecr-app # Nombre de la aplicación EB (Parte 1)
+  EB_ENVIRONMENT_NAME: palette-generator-ecr-env # Nombre del entorno EB (Parte 1)
+  DOCKER_IMAGE_TAG: ${{ github.sha }}       # Usaremos el hash del commit como tag
+  S3_BUCKET_NAME: elasticbeanstalk-${{ env.AWS_REGION }}-${{ secrets.AWS_ACCESS_KEY_ID }} # Nombre del bucket S3 de EB (lo crearemos con el ID)
 
-# A workflow run is made up of one or more jobs that can run sequentially or in parallel
 jobs:
-  # This workflow contains a single job called "build"
-  build:
-    # The type of runner that the job will run on
+  deploy:
     runs-on: ubuntu-latest
 
-    # Steps represent a sequence of tasks that will be executed as part of the job
     steps:
-      # Checks-out your repository under $GITHUB_WORKSPACE, so your job can access it
-      - uses: actions/checkout@v4
+    - name: 📥 Checkout del Código
+      uses: actions/checkout@v4
 
-      # Runs a single command using the runners shell
-      - name: Run a one-line script
-        run: echo Hello, world!
+    # 1. Configurar Credenciales AWS y Login en ECR
+    - name: 🔨 Configurar AWS Credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: ${{ env.AWS_REGION }}
 
-      # Runs a set of commands using the runners shell
-      - name: Run a multi-line script
-        run: |
-          echo Add other actions to build,
-          echo test, and deploy your project.
+    - name: 🔑 Login en Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    # 2. Construir, Taggear y Push a ECR
+    - name: 🏗️ Construir, Taggear y Push de la Imagen Docker
+      id: build-image
+      env:
+        # URI del ECR obtenida del paso de login.
+        ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+        IMAGE_URI: ${{ steps.login-ecr.outputs.registry }}/${{ env.ECR_REPOSITORY }}:${{ env.DOCKER_IMAGE_TAG }}
+      run: |
+        # Build de la imagen Docker
+        docker build -t ${{ env.ECR_REPOSITORY }} .
+        # Taggear la imagen con la URI completa de ECR
+        docker tag ${{ env.ECR_REPOSITORY }}:latest ${{ env.IMAGE_URI }}
+        # Push de la imagen a ECR
+        docker push ${{ env.IMAGE_URI }}
+        # Exportar la URI para el siguiente paso (EB deployment)
+        echo "IMAGE_URI_FULL=${{ env.IMAGE_URI }}" >> $GITHUB_ENV
+        
+    # 3. Preparar el Paquete de Despliegue para EB
+    - name: ✏️ Crear archivo Dockerrun.aws.json con URI de ECR
+      run: |
+        # Reemplazamos el campo 'Name' en Dockerrun.aws.json con la URI completa de la imagen que acabamos de subir.
+        # jq es una herramienta para procesar JSON, útil en scripts de shell.
+        sudo apt-get install jq
+        cat Dockerrun.aws.json | jq --arg uri "${{ env.IMAGE_URI_FULL }}" '.Image.Name = $uri' > Dockerrun.aws.json.new
+        mv Dockerrun.aws.json.new Dockerrun.aws.json
+        
+    - name: 📦 Empaquetar y Subir a S3
+      run: |
+        # El paquete de despliegue sólo necesita el Dockerrun.aws.json y el .ebextensions (si existieran)
+        zip deployment_package.zip Dockerrun.aws.json
+        
+        # Sube el ZIP al bucket de Elastic Beanstalk. 
+        # Si el bucket no existe, esta acción fallará a menos que se use la CLI. 
+        # Para simplificar, usaremos la acción de despliegue que maneja esto.
+
+    # 4. Despliegue en Elastic Beanstalk
+    - name: 🚀 Desplegar en Elastic Beanstalk
+      uses: aws-actions/elastic-beanstalk-deploy@v1
+      with:
+        application_name: ${{ env.EB_APPLICATION_NAME }}
+        environment_name: ${{ env.EB_ENVIRONMENT_NAME }}
+        region: ${{ env.AWS_REGION }}
+        # La acción de EB subirá este ZIP a S3 y lo desplegará
+        deployment_package: deployment_package.zip
+        version_label: ${{ env.DOCKER_IMAGE_TAG }}
+        wait_for_deployment: true
