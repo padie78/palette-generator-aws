@@ -1,1 +1,2 @@
 # palette-generator-aws
+test
